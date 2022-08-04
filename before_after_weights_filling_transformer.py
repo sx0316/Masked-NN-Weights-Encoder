@@ -14,17 +14,19 @@ import torch.optim as optim
 import torch.utils.data as data
 import torchvision
 import torchvision.transforms as transforms
-import torchvision.datasets as datasets
+from torchvision.datasets import MNIST
 import torchvision.models as models
 import torch.utils.data.dataloader as dataloader
 import numpy as np
+from torch.utils.data import DataLoader
 from torchmetrics import MeanSquaredError
 
 import torch
 
 batch_size = 2
-max_size = 512
+max_size = 128
 torch.set_default_dtype(torch.double)
+img_batch_size = 10
 
 def get_np_fixed_length(list_like, length):
     list_length = len(list_like)
@@ -39,7 +41,9 @@ def load_pretrained_weight_matrices(num_matrices):
     # Option 1: passing weights param as string
     pretrained_model = torch.hub.load("pytorch/vision", "resnet50", weights="IMAGENET1K_V2")
     # cache is in /root/.cache/torch/hub/pytorch_vision_main
-
+    transform = transforms.Compose([transforms.ToTensor()])
+    # initialzie the training and validation dataset
+    print("[INFO] loading the training and validation dataset...")
     pretrained_weights = []
 
     for name, param in pretrained_model.named_parameters():
@@ -97,6 +101,8 @@ class RNNDataloader(dataloader.DataLoader):
         self.shuffle = shuffle
         self.num_workers = num_workers
 
+        pretrained_weights = []
+
     def __iter__(self):
         """
         Iterate through the dataset.
@@ -118,6 +124,7 @@ class RNNDataloader(dataloader.DataLoader):
                 prev, after = t[0][0][1].clone().detach(), t[2][0][1].clone().detach()
                 masked, prev, after = self.format_(masked), self.format_(prev), self.format_(after)
                 target = self.format_(target)
+                print("dataloader",target.shape)
 
                 masked_.append([masked, prev, after])
                 targ_.append(target)
@@ -145,8 +152,23 @@ class RNN(nn.Module):
         self.prev_layer = nn.Linear(input_size, hidden_size)
         self.after_layer = nn.Linear(input_size, hidden_size)
         self.hidden_layer = nn.Linear(hidden_size, hidden_size)
-        self.output_layer = nn.Linear(hidden_size, output_size)
+        self.output_layer = nn.Linear(hidden_size*3, output_size)
         self.attn = nn.MultiheadAttention(hidden_size, hidden_size)
+        self.img_batch_size = 8
+        self.resize_sz = 224
+        self.src_dataset = MNIST(root="./mnist", train=True,
+                                 download=True, transform= transforms.Compose([transforms.Resize(self.resize_sz),
+                                               transforms.ToTensor(),
+                                               ]))
+        self.trainDataLoader = DataLoader(self.src_dataset, batch_size=self.img_batch_size, shuffle=True)
+        self.img_batch = next(iter(self.trainDataLoader))
+        self.src_img = self.img_batch[0]#.squeeze(1)
+        self.src_img = self.src_img.squeeze(1)
+        self.src_img = torch.flatten(self.src_img, start_dim=0, end_dim=1)
+        self.src_img = torch.permute(self.src_img, (1,0))
+        self.img_layer = nn.Linear(self.src_img.shape[1],self.hidden_size)
+        self.coordinating_layer = nn.Bilinear(self.resize_sz, self.hidden_size*3,self.hidden_size*3)
+
 
     def forward(self, input, hidden):
         """
@@ -160,13 +182,16 @@ class RNN(nn.Module):
         prev_ = self.prev_layer(prev)
         after = input[2].to(torch.double).clone()
         after_ = self.after_layer(after)
+        img_ = self.img_layer(self.src_img)
+        img_ = torch.permute(img_, (1, 0))
 
-        h0 = self.hidden_layer(hidden.clone())
-        #   hidden = F.relu(hidden.clone(), inplace=False)
-       # print(input_.shape, h0.shape)
-        output = self.attn(input_, prev_, after_)
+        print("img:", img_.shape, input_.shape)
 
-        output = self.output_layer(output[0].clone())
+        output = self.attn(prev_, after_, input_)[0]
+        output = torch.permute(output, (1,0))
+        coord = self.coordinating_layer(img_, output)
+
+        output = torch.permute(coord, (1,0))
         return output, hidden
 
     def init_hidden(self, batch_size):
@@ -207,7 +232,7 @@ def train(model, dataloader, validation_dl, num_epochs, learning_rate):
             # 5. Forward pass
             outputs, hidden = model(inputs, hidden.clone())
             # 6. Compute the loss
-          #  print("loss", targets[0].shape)
+            print("loss", targets[0].shape)
             loss = criterion(outputs.clone(), targets[0].clone())
             # 7. Compute the gradients
             loss.backward(retain_graph=True)
