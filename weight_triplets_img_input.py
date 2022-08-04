@@ -22,11 +22,10 @@ from torch.utils.data import DataLoader
 from torchmetrics import MeanSquaredError
 from cifar10_models.resnet import resnet18, resnet34, resnet50
 from torch.utils.data.dataloader import default_collate
+import math
 
 
-import torch
-
-batch_size = 2
+batch_size = 5
 max_size = 512
 torch.set_default_dtype(torch.double)
 img_batch_size = 10
@@ -108,6 +107,14 @@ class RNNDataloader(dataloader.DataLoader):
         self.batch_size = 1  # batch_size
         self.shuffle = shuffle
         self.num_workers = num_workers
+        self.img_batch_size = 50
+        self.resize_sz = 32
+        self.src_dataset = CIFAR10(root="~/matrix_filling/", train=True,
+                                 download=False, transform= transforms.Compose([transforms.Resize(self.resize_sz),
+                                               transforms.ToTensor(),
+                                               ]))
+        self.trainDataLoader = DataLoader(self.src_dataset, batch_size=self.img_batch_size, shuffle=True)
+        self.img_batch = next(iter(self.trainDataLoader))
 
         pretrained_weights = []
 
@@ -127,14 +134,18 @@ class RNNDataloader(dataloader.DataLoader):
             masked_, targ_ = [], []
 
             for t in batch:
-
+                seed = math.floor(np.random.rand()*(len(self.img_batch)-1))
+                img = self.img_batch[seed]
+               # print("dataloader img", img.shape)
+                img = torch.flatten(img, start_dim=0, end_dim=2)
+                img = torch.permute(img, (1,0))
                 masked, target = t[1][0][0].clone().detach(), t[1][1][0].clone().detach()
                 prev, after = t[0][0][1].clone().detach(), t[2][0][1].clone().detach()
                 masked, prev, after = self.format_(masked), self.format_(prev), self.format_(after)
                 target = self.format_(target)
-                print("dataloader",target.shape)
+               # print("dataloader",target.shape)
 
-                masked_.append([masked, prev, after])
+                masked_.append([masked, prev, after, img])
                 targ_.append(target)
 
             yield masked_, targ_
@@ -168,7 +179,7 @@ class RNN(nn.Module):
         self.img_batch_size = 8
         self.dummy_param = nn.Parameter(torch.empty(0))
 
-        self.resize_sz = 224
+        self.resize_sz = 32
         self.src_dataset = CIFAR10(root="~/matrix_filling/", train=True,
                                  download=False, transform= transforms.Compose([transforms.Resize(self.resize_sz),
                                                transforms.ToTensor(),
@@ -181,7 +192,7 @@ class RNN(nn.Module):
         self.src_img = torch.flatten(self.src_img, start_dim=0, end_dim=2)
         self.src_img = torch.permute(self.src_img, (1,0))
         self.src_img = self.src_img.to(torch.device("cpu"))#.to(d0)
-        self.img_layer = nn.Linear(self.src_img.shape[1],self.hidden_size)
+        self.img_layer = nn.Linear(4800,self.hidden_size)
         self.coordinating_layer = nn.Bilinear(self.resize_sz, self.hidden_size*3,self.hidden_size*3)
 
 
@@ -197,14 +208,14 @@ class RNN(nn.Module):
         prev_ = self.prev_layer(prev)
         after = input[2].double().clone()
         after_ = self.after_layer(after)
-        img_ = self.img_layer(self.src_img)
+        img_ = self.img_layer(input[3].clone())
         img_ = torch.permute(img_, (1, 0))
 
-        print("img:", img_.shape, input_.shape)
+      #  print("img:", img_.shape, input_.shape)
 
         output = self.attn(prev_, after_, input_)[0]
         output = torch.permute(output, (1,0))
-        print("attn_out:", output.shape)
+      #  print("attn_out:", output.shape)
         coord = self.coordinating_layer(img_, output)
 
         output = torch.permute(coord, (1,0))
@@ -246,14 +257,11 @@ def train(model, dataloader, validation_dl, num_epochs, learning_rate):
 
             optimizer.zero_grad()
             # 5. Forward pass
-            print(model.dummy_param.device)
             inputs_ = inputs[0]
-            for i in inputs_:
-              i.to(torch.device("cpu"))
-              print(i.get_device())
+
             outputs = model(inputs_)
             # 6. Compute the loss
-            print("loss", targets[0].shape)
+          #  print("loss", targets[0].shape)
             loss = criterion(outputs.clone(), targets[0].clone())
             # 7. Compute the gradients
             loss.backward(retain_graph=True)
@@ -269,6 +277,7 @@ def train(model, dataloader, validation_dl, num_epochs, learning_rate):
             valid_loss += vloss.item()
 
         print("Epoch: ",epoch, "Training Loss: ", loss.item(), "Validation Loss:", valid_loss)
+        torch.save(model.state_dict(), "varying_img_model" + str(epoch) + ".pt")
     # 10. Save the model
     torch.save(model.state_dict(), "model.pt")
     # 11. Return the model
