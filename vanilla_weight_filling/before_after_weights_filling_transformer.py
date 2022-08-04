@@ -26,6 +26,7 @@ batch_size = 2
 max_size = 512
 torch.set_default_dtype(torch.double)
 
+
 def get_np_fixed_length(list_like, length):
     list_length = len(list_like)
     np_array = np.zeros(length)
@@ -246,6 +247,8 @@ def load_model():
     model = RNN(input_size, hidden_size, output_size)
     model.load_state_dict(torch.load("model.pt"))
     return model
+
+#load imagenet 1k dataset from pytorch.datsets
 
 
 data = load_pretrained_weight_matrices(100)
