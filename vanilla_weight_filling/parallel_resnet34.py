@@ -25,13 +25,14 @@ from torch.utils.data.dataloader import default_collate
 import math
 import wandb
 import gc
+from torch.cuda.amp import GradScaler
 
-batch_size = 3
+batch_size = 4
 max_size = 512
 torch.set_default_dtype(torch.double)
 img_batch_size = 10
 #d0 = torch.device("cuda:0")
-d1 = torch.device("cuda:1")
+d1 = torch.device("cuda:0")
 
 def get_np_fixed_length(list_like, length):
     list_length = len(list_like)
@@ -144,7 +145,7 @@ class RNNDataloader(dataloader.DataLoader):
                 img = torch.flatten(img, start_dim=0, end_dim=1)
                 img = torch.permute(img, (2,1,0))
                 masked, target = t[1][0].clone().detach(), t[1][1].clone().detach()
-                prev, after = t[0][1].clone().detach(), t[2][1].clone().detach()
+                prev, after = t[0][0].clone().detach(), t[2][0].clone().detach()
                 masked, prev, after = self.format_(masked), self.format_(prev), self.format_(after)
                 target = self.format_(target)
                # print("dataloader",target.shape)
@@ -186,17 +187,6 @@ class RNN(nn.Module):
         self.dummy_param = nn.Parameter(torch.empty(0))
 
         self.resize_sz = hidden_size
-        #src_dataset = CIFAR10(root="~/matrix_filling/", train=True,
-        #                         download=False, transform= transforms.Compose([transforms.Resize(self.resize_sz),
-        #                                       transforms.ToTensor(),
-        #                                       ]))
-        #trainDataLoader = DataLoader(self.src_dataset, batch_size=self.img_batch_size, shuffle=True, )
-        #img_batch = next(iter(self.trainDataLoader))
-        #self.src_img = self.img_batch[0]#.squeeze(1)
-        #print(self.src_img.shape)
-        #self.src_img = self.src_img.squeeze(1)
-        #self.src_img = torch.flatten(self.src_img, start_dim=0, end_dim=1)
-       # self.src_img = torch.permute(self.src_img, (1,0))
 
         self.img_layer = nn.Linear(750,self.hidden_size)
         self.coordinating_layer = nn.Bilinear(self.resize_sz, 9,9)
@@ -254,11 +244,12 @@ def train(model, dataloader, validation_dl, num_epochs, learning_rate, logging):
     # 1. Define the loss and optimizer
     #criterion = nn.CrossEntropyLoss()
     criterion = nn.MSELoss()
-    #hidden = model.init_hidden(9)
+    use_amp = True
 
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     optimizer.zero_grad(set_to_none=True)
     torch.autograd.set_detect_anomaly(True)
+    scaler = GradScaler(enabled=use_amp)
     # 2. Iterate through the data for num_epochs
     for epoch in range(num_epochs):
         # 3. Iterate through the data for one epoch
@@ -270,16 +261,22 @@ def train(model, dataloader, validation_dl, num_epochs, learning_rate, logging):
             inputs_ = inputs[0]
             target_ = targets[0].to(d1)
 
-            outputs = model(inputs_)
+            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
+
+              outputs = model(inputs_)
+            #print("loss", outputs.shape, targets[0].shape)
+              loss = criterion(outputs, target_)
             del inputs_
             torch.cuda.empty_cache()
-            # 6. Compute the loss
-            #print("loss", outputs.shape, targets[0].shape)
-            loss = criterion(outputs, target_)
             # 7. Compute the gradients
-            loss.backward()#retain_graph=True)
+            scaler.scale(loss).backward()#retain_graph=True)
             # 8. Update the weights
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            #loss.backward()
+            #optimizer.step()
+
             gc.collect()
             del target_, outputs
             torch.cuda.empty_cache()
@@ -302,7 +299,8 @@ def train(model, dataloader, validation_dl, num_epochs, learning_rate, logging):
 
         gc.collect()
         print("Epoch: ",epoch, "Training Loss: ", loss.item(), "Validation Loss:", valid_loss)
-        torch.save(model.state_dict(), "par_img_model" + str(epoch) + ".pt")
+        if epoch % 10 == 0:
+          torch.save(model.state_dict(), "par_0.9_model" + str(epoch) + ".pt")
         del loss, mse
         torch.cuda.empty_cache()
     # 10. Save the model
@@ -331,8 +329,8 @@ def load_model():
 
 import random
 
-logging = False
-data = load_pretrained_weight_matrices(0.6)
+logging = True
+data = load_pretrained_weight_matrices(0.9)
 random.shuffle(data)
 print("Data Size:", len(data))
 test_size = int(len(data) * 0.92)
