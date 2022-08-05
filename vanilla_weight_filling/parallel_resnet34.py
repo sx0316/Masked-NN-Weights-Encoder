@@ -26,6 +26,7 @@ import math
 import wandb
 import gc
 from torch.cuda.amp import GradScaler
+from torch.nn.utils import clip_grad_norm_ as clipGN
 
 batch_size = 4
 max_size = 512
@@ -33,6 +34,7 @@ torch.set_default_dtype(torch.double)
 img_batch_size = 10
 #d0 = torch.device("cuda:0")
 d1 = torch.device("cuda:0")
+torch.backends.cudnn.benchmark = True
 
 def get_np_fixed_length(list_like, length):
     list_length = len(list_like)
@@ -104,7 +106,7 @@ class RNNDataloader(dataloader.DataLoader):
     DataLoader for the RNN.
     """
 
-    def __init__(self, data, batch_size, shuffle=True, num_workers=1):
+    def __init__(self, data, batch_size, shuffle=True, num_workers=1, pin_memory=False):
         super(dataloader.DataLoader, self).__init__()
         self.data = data
         self.data = self.data
@@ -112,6 +114,7 @@ class RNNDataloader(dataloader.DataLoader):
         self.shuffle = shuffle
         self.num_workers = num_workers
         self.img_batch_size = 250
+        self.pin_memory = pin_memory
         self.resize_sz = max_size
         src_dataset = CIFAR10(root="~/matrix_filling/", train=True,
                                  download=False, transform= transforms.Compose([transforms.Resize(self.resize_sz),
@@ -185,7 +188,7 @@ class RNN(nn.Module):
         self.attn = nn.MultiheadAttention(hidden_size, hidden_size)
         self.img_batch_size = 8
         self.dummy_param = nn.Parameter(torch.empty(0))
-
+        self.clip_val = 1
         self.resize_sz = hidden_size
 
         self.img_layer = nn.Linear(750,self.hidden_size)
@@ -237,7 +240,7 @@ class RNN(nn.Module):
 
 # Write training code with dataloader
 # 3. Train the model
-def train(model, dataloader, validation_dl, num_epochs, learning_rate, logging):
+def train(model, dataloader, validation_dl, num_epochs, learning_rate, logging, pin_memory):
     """
     Train the model.
     """
@@ -259,18 +262,19 @@ def train(model, dataloader, validation_dl, num_epochs, learning_rate, logging):
             optimizer.zero_grad()
             # 5. Forward pass
             inputs_ = inputs[0]
-            target_ = targets[0].to(d1)
+            target_ = targets[0].cuda(non_blocking=pin_memory).to(d1)
 
             with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
 
               outputs = model(inputs_)
-            #print("loss", outputs.shape, targets[0].shape)
+              #print("loss", outputs.shape, targets[0].shape)
               loss = criterion(outputs, target_)
             del inputs_
             torch.cuda.empty_cache()
             # 7. Compute the gradients
             scaler.scale(loss).backward()#retain_graph=True)
             # 8. Update the weights
+            clipGN(model.parameters(), model.clip_val)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
@@ -329,8 +333,8 @@ def load_model():
 
 import random
 
-logging = True
-data = load_pretrained_weight_matrices(0.9)
+logging, pin_memory = True, True
+data = load_pretrained_weight_matrices(0.3)
 random.shuffle(data)
 print("Data Size:", len(data))
 test_size = int(len(data) * 0.92)
@@ -345,6 +349,6 @@ if logging:
   "batch_size": 128
   }
   wandb.watch(model)
-dataloader_ = RNNDataloader(train_set, batch_size=batch_size)
-validation_dataloader_ = RNNDataloader(val_set, batch_size=batch_size)
-tmodel = train(model, dataloader_, validation_dataloader_, num_epochs=100, learning_rate=0.001, logging = logging)
+dataloader_ = RNNDataloader(train_set, batch_size=batch_size, pin_memory=pin_memory)
+validation_dataloader_ = RNNDataloader(val_set, batch_size=batch_size, pin_memory=pin_memory)
+tmodel = train(model, dataloader_, validation_dataloader_, num_epochs=100, learning_rate=0.001, logging = logging, pin_memory = pin_memory)
