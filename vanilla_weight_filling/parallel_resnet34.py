@@ -71,10 +71,10 @@ def load_pretrained_weight_matrices(mask_ratio):
             except:
                 continue
             if (cur.shape[0] > max_size) or (cur.shape[1] > max_size) : continue
-            print("start")
-            print(name, cur_torch.shape)
+            #print("start")
+            #print(name, cur_torch.shape)
             cur_torch = torch.flatten(cur_torch, start_dim=2, end_dim=3)
-            print("after", cur_torch.shape)
+            #print("after", cur_torch.shape)
             cur = cur_torch.cpu().detach().numpy()
             mask = np.random.rand(*cur.shape)
             bool_mask = mask < mask_ratio
@@ -94,9 +94,10 @@ def load_pretrained_weight_matrices(mask_ratio):
             # A2[:cur.shape[0],:cur.shape[1] ,:cur.shape[2] , :cur.shape[3]] = masked
 
           #  pretrained_weights.append((torch.from_numpy(A2), torch.from_numpy(A)))
-        elif 'bn' in name:
-            print(name)
+       # elif 'bn' in name:
+       #     print(name)
 
+    print("finished loading weight matrices from pretrained neural network")
     return pretrained_weights
 
 
@@ -115,10 +116,8 @@ class RNNDataloader(dataloader.DataLoader):
         self.num_workers = num_workers
         self.img_batch_size = 250
         self.pin_memory = pin_memory
-        self.resize_sz = max_size
-        src_dataset = CIFAR10(root="~/matrix_filling/", train=True,
-                                 download=False, transform= transforms.Compose([transforms.Resize(self.resize_sz),
-                                               transforms.ToTensor(),
+        self.resize_sz = 32
+        src_dataset = CIFAR10(root='./data', train=True, download=True, transform= transforms.Compose([transforms.ToTensor(),transforms.Normalize([0.4914, 0.4822, 0.4465], [0.2471, 0.2435, 0.2616]),
                                                ]))
         trainDataLoader = DataLoader(src_dataset, batch_size=self.img_batch_size, shuffle=True)
         self.img_batch = next(iter(trainDataLoader))
@@ -133,6 +132,7 @@ class RNNDataloader(dataloader.DataLoader):
         # 1. Get the data
         data = self.data
         groups = [[data[i-1], data[i], data[i+1]]for i in range(1, len(data)-1)]
+        groups.append([data[-2], data[-1], data[-2]])
 
         # 3. Split the data into batches
         batches = [groups[i:i + self.batch_size] for i in range(0, len(groups), self.batch_size)]
@@ -148,34 +148,38 @@ class RNNDataloader(dataloader.DataLoader):
                 img = torch.flatten(img, start_dim=0, end_dim=1)
                 img = torch.permute(img, (2,1,0))
                 masked, target = t[1][0].clone().detach(), t[1][1].clone().detach()
-                prev, after = t[0][0].clone().detach(), t[2][0].clone().detach()
-                masked, prev, after = self.format_(masked), self.format_(prev), self.format_(after)
-                target = self.format_(target)
+                prev, after = t[0][1].clone().detach(), t[2][0].clone().detach()
+                try:
+                  masked, prev, after = self.format_(masked), self.format_(prev), self.format_(after)
+                  target = self.format_(target)
                # print("dataloader",target.shape)
 
-                masked_.append([masked, prev, after, img])
-                targ_.append(target)
+                  masked_.append([masked, prev, after, img])
+                  targ_.append(target)
+                except Exception as e:
+                  print(e)
 
             yield masked_, targ_
 
-    def format_(self, data):
+    def format_(self, data_input):
         """
         Format the data.
         """
        # data = torch.squeeze(torch.cat(data.unbind()).unsqueeze(0))
-        data = torch.Tensor(data)
-        data = torch.permute(data, (2, 0, 1))
-        data = data.double()
+        data_ = torch.Tensor(data_input)
+        #print("data_",data_.shape)
+        data_ = torch.permute(data_, (2, 0, 1))
+        data_ = data_.double()
 
        # print(data.get_device())
-        return data
+        return data_
 
 class RNN(nn.Module):
     """
     RNN from scratch for a sequence of data in pytorch
     """
 
-    def __init__(self, input_size, hidden_size, output_size):
+    def __init__(self, input_size, hidden_size, output_size, mask_ratio):
         super(RNN, self).__init__()
         self.hidden_size = hidden_size
         self.input_size = input_size
@@ -184,15 +188,18 @@ class RNN(nn.Module):
         self.prev_layer = nn.Linear(input_size, hidden_size)
         self.after_layer = nn.Linear(input_size, hidden_size)
         self.hidden_layer = nn.Linear(hidden_size, hidden_size)
-        self.output_layer = nn.Linear(hidden_size*3, output_size)
+        self.unflatten_layer = nn.Unflatten(2, torch.Size([3,3]))
         self.attn = nn.MultiheadAttention(hidden_size, hidden_size)
         self.img_batch_size = 8
         self.dummy_param = nn.Parameter(torch.empty(0))
         self.clip_val = 1
-        self.resize_sz = hidden_size
+        self.resize_sz = 32
+        self.output_layer = nn.Linear(self.resize_sz, 9)
+        self.transition_layer = nn.Linear(hidden_size, self.resize_sz)
+        self.mask_ratio = mask_ratio
 
         self.img_layer = nn.Linear(750,self.hidden_size)
-        self.coordinating_layer = nn.Bilinear(self.resize_sz, 9,9)
+        self.coordinating_layer = nn.Bilinear(self.resize_sz, 9,hidden_size)
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -210,19 +217,29 @@ class RNN(nn.Module):
         after = input[2].to(d1)
         after_ = self.after_layer(after)
         img_ = self.img_layer(input[3].to(d1))
+        img_ = torch.permute(img_, (2,1,0))
 
-       # print("img:", img_.shape, input_.shape)
+      #  print("img:", img_.shape)
 
         output = self.attn(prev_, after_, input_)[0]
-        output = torch.permute(output, (1,2,0))
-      #  print("attn_out:", output.shape)
-        coord = self.coordinating_layer(img_, output)
-        output = torch.permute(coord, (2,1,0))
 
+        output = self.transition_layer(output)
+        output = torch.permute(output, (1,2, 0))
+       # print("attn_out:", output.shape)
+        coord = self.coordinating_layer(img_, output)
+        coord = torch.permute(coord, (0,2,1))
+       # print("coord", coord.shape)
+        output = self.output_layer(coord)
+
+        output = torch.permute(output, (2,0,1))
+       # print("output", output.shape)
+        unflattened = torch.permute(output, (1,2,0))
+        unflattened = self.unflatten_layer(unflattened)
+       # print("unflatten", unflattened.shape)
         gc.collect()
         del input__, prev, after, input_, prev_, after_, img_, coord
         torch.cuda.empty_cache()
-        return output
+        return output, unflattened
 
     def init_hidden(self, batch_size):
         """
@@ -266,8 +283,8 @@ def train(model, dataloader, validation_dl, num_epochs, learning_rate, logging, 
 
             with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
 
-              outputs = model(inputs_)
-              #print("loss", outputs.shape, targets[0].shape)
+              outputs, unflattened = model(inputs_)
+            #  print("loss", outputs.shape, targets[0].shape)
               loss = criterion(outputs, target_)
             del inputs_
             torch.cuda.empty_cache()
@@ -290,7 +307,7 @@ def train(model, dataloader, validation_dl, num_epochs, learning_rate, logging, 
         for vinputs, vtargets in validation_dl:
             vtarget_ = vtargets[0].to(d1)
             vinputs_ = vinputs[0]
-            voutputs= model(vinputs_)
+            voutputs, unflattened = model(vinputs_)
             vloss = mse(voutputs, vtarget_)
             valid_loss += vloss.item()
             gc.collect()
@@ -302,13 +319,13 @@ def train(model, dataloader, validation_dl, num_epochs, learning_rate, logging, 
             wandb.log({"vloss": valid_loss},step=epoch)
 
         gc.collect()
-        print("Epoch: ",epoch, "Training Loss: ", loss.item(), "Validation Loss:", valid_loss)
-        if epoch % 10 == 0:
-          torch.save(model.state_dict(), "par_0.9_model" + str(epoch) + ".pt")
+        print("Epoch: ",epoch, "Training Loss: ", loss.item(), "Validation MSE:", valid_loss)
+        #if epoch % 10 == 0:
+        #  torch.save(model.state_dict(), "par_0.9_model" + str(epoch) + ".pt")
         del loss, mse
         torch.cuda.empty_cache()
     # 10. Save the model
-    torch.save(model.state_dict(), "par.pt")
+    torch.save(model.state_dict(), "par_shaped.pt")
     # 11. Return the model
     return model
 
@@ -333,13 +350,14 @@ def load_model():
 
 import random
 
-logging, pin_memory = True, True
-data = load_pretrained_weight_matrices(0.3)
+logging, pin_memory = False, True
+mask_ratio = 0.3
+data = load_pretrained_weight_matrices(mask_ratio)
 random.shuffle(data)
 print("Data Size:", len(data))
 test_size = int(len(data) * 0.92)
 train_set, val_set = data[:test_size], data[test_size:]
-model = RNN(max_size, max_size, max_size)
+model = RNN(max_size, max_size, max_size, mask_ratio)
 model.to(d1)
 if logging:
   wandb.init(project="Weight Masking", entity="zs0316")
@@ -351,4 +369,4 @@ if logging:
   wandb.watch(model)
 dataloader_ = RNNDataloader(train_set, batch_size=batch_size, pin_memory=pin_memory)
 validation_dataloader_ = RNNDataloader(val_set, batch_size=batch_size, pin_memory=pin_memory)
-tmodel = train(model, dataloader_, validation_dataloader_, num_epochs=100, learning_rate=0.001, logging = logging, pin_memory = pin_memory)
+tmodel = train(model, dataloader_, validation_dataloader_, num_epochs=500, learning_rate=0.001, logging = logging, pin_memory = pin_memory)
