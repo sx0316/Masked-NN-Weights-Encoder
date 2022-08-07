@@ -60,16 +60,16 @@ def load_pretrained_weight_matrices(mask_ratio):
     pretrained_weights, biases = [], {}
 
     for name, param in pretrained_model.named_parameters():
-        #print(name, pretrained_model.state_dict()[param].shape)
+        print(name, param.shape)
+        cur = param.detach().numpy()
+        cur_torch = torch.from_numpy(cur)
         if 'bn' in name:
-           cur = param.detach().numpy()
-           cur_torch = torch.from_numpy(cur)
            A = np.zeros([max_size])
            A[:cur_torch.shape[0]] = cur
            res = torch.from_numpy(A).double()#.unsqueeze(0)
            #res = res.unsqueeze(0)
            layer_name = name.split(".bn")[0]
-           print(name, cur_torch.shape)
+           #print(name, cur_torch.shape)
            if layer_name not in biases:
               biases[layer_name] = [None, None]
            if 'weight' in name:
@@ -77,20 +77,26 @@ def load_pretrained_weight_matrices(mask_ratio):
            else:
              biases[layer_name][1] = res
 
+        elif "fc" in name:
+
+            if 'weight'in name:
+              A = np.zeros([max_size, max_size, 9])
+              A[:cur.shape[0], :cur.shape[1],0] = cur
+              res = torch.from_numpy(A).double()
+              pretrained_weights.append([res, res, "last"])
+            else:
+              A = np.zeros([max_size])
+              A[:cur_torch.shape[0]] = cur
+              res = torch.from_numpy(A).double()
+              biases["last"] = [res, res]
+
+
         elif 'weight' in name:
-            cur = param.detach().numpy()
-            cur_torch = torch.from_numpy(cur)
-
-                # cur_fixed = get_np_fixed_length(cur, cur.shape[0])
             A, A2 = np.zeros([max_size, max_size, 9]), np.zeros([max_size, max_size, 9])
-
-
-           # print(cur_torch.shape, cur.shape)
             try:
-                s = cur.shape[2]
+              x = cur.shape[2]
             except:
-                continue
-            #print("start")
+              continue
             #print(name, cur_torch.shape)
             cur_torch = torch.flatten(cur_torch, start_dim=2, end_dim=3)
             #print("after", cur_torch.shape)
@@ -98,28 +104,15 @@ def load_pretrained_weight_matrices(mask_ratio):
             mask = np.random.rand(*cur.shape)
             bool_mask = mask < mask_ratio
             masked = torch.from_numpy(bool_mask * cur)
-            shapes = [1 for i in range(4)]
-
-            for i in range(4):
-                try:
-                    shapes[i] = cur.shape[i]
-                except:
-                    continue
-            A[:shapes[0], :shapes[1], :shapes[2]] = cur
-           # B = np.einsum('ijkl->lkji', A)
-            A2[:shapes[0], :shapes[1], :shapes[2]] = masked
-           # B2 = np.einsum('ijkl->lkji', A2)
-
+            A[:cur_torch.shape[0], :cur_torch.shape[1], :cur_torch.shape[2]] = cur
+            A2[:cur_torch.shape[0], :cur_torch.shape[1], :cur_torch.shape[2]] = masked
             layer_name = name.split(".downsample")[0] if "downsample" in name else name.split(".conv")[0]
+            pretrained_weights.append([torch.from_numpy(A2).double(), torch.from_numpy(A).double(), layer_name])
+        else:
+            print(name)
 
-            pretrained_weights.append((torch.from_numpy(A2).double(), torch.from_numpy(A).double(), layer_name))
-            # A2[:cur.shape[0],:cur.shape[1] ,:cur.shape[2] , :cur.shape[3]] = masked
 
-          #  pretrained_weights.append((torch.from_numpy(A2), torch.from_numpy(A)))
-       # elif 'bn' in name:
-       #     print(name)
-
-    print("finished loading weight matrices from pretrained neural network")
+    print("[INFO] Finished loading weight matrices from pretrained neural network")
     return pretrained_weights, biases
 
 
@@ -135,14 +128,17 @@ class RNNDataloader(dataloader.DataLoader):
         self.batch_size =  batch_size
         self.shuffle = shuffle
         self.num_workers = num_workers
-        self.img_batch_size = 3
+        self.img_batch_size = batch_size
         self.pin_memory = pin_memory
         self.resize_sz = 32
+        self.biases = biases
         src_dataset = CIFAR10(root='./data', train=True, download=True, transform= transforms.Compose([transforms.ToTensor(),transforms.Normalize([0.4914, 0.4822, 0.4465], [0.2471, 0.2435, 0.2616]),
                                                ]))
         trainDataLoader = DataLoader(src_dataset, batch_size=self.img_batch_size, shuffle=True)
+
+
         self.img_batch = next(iter(trainDataLoader))
-        self.biases = biases
+
         del src_dataset, trainDataLoader
         gc.collect()
         torch.cuda.empty_cache()
@@ -154,7 +150,8 @@ class RNNDataloader(dataloader.DataLoader):
         # 1. Get the data
         data = self.data
         groups = [[data[i-1], data[i], data[i+1]]for i in range(1, len(data)-1)]
-        groups.append([data[-2], data[-1], data[-2]])
+        groups.append([data[-2], data[-1], data[-1]])
+
 
         # 3. Split the data into batches
         batches = [groups[i:i + self.batch_size] for i in range(0, len(groups), self.batch_size)]
@@ -179,14 +176,8 @@ class RNNDataloader(dataloader.DataLoader):
                   masked, prev, after = self.format_(masked), self.format_(prev), self.format_(after)
                   target = self.format_(target)
                   bn = torch.vstack((bn_weight, bn_biases))
-                 # print("dataloader0",bn.shape)
                   bn_ = bn.repeat(512, 1, 1)
                   bn_ = torch.permute(bn_, (0,2,1))
-                 # print("dataloader1", bn_.shape)
-                 # bn_ = bn_.unsqueeze(0)
-                 # bn_ = bn_.repeat(9, 1, 1)
-                 # print("dataloader",bn_.shape)
-
                   masked_.append([masked, prev, after, img, bn_])
                   targ_.append(target)
                 except Exception as e:
@@ -221,7 +212,7 @@ class RNN(nn.Module):
         self.prev_layer = nn.Linear(input_size, hidden_size)
         self.after_layer = nn.Linear(input_size, hidden_size)
         self.hidden_layer = nn.Linear(hidden_size, hidden_size)
-        self.normalization_layer = nn.Linear(input_size, hidden_size)
+        self.classifier_layer = nn.Linear(input_size, hidden_size)
         self.bias_layer = nn.Linear(2, 9)
         self.unflatten_layer = nn.Unflatten(2, torch.Size([3,3]))
         self.attn1 = nn.MultiheadAttention(hidden_size, hidden_size)
@@ -276,7 +267,7 @@ class RNN(nn.Module):
         unflattened = self.unflatten_layer(unflattened)
        # print("unflatten", unflattened.shape)
         gc.collect()
-        del input__, prev, after, input_, prev_, after_, img_, coord
+        del input__, prev, after, input_, prev_, after_, img_, coord, bn, bn_
         torch.cuda.empty_cache()
         return output, unflattened
 
@@ -363,7 +354,7 @@ def train(model, dataloader, validation_dl, num_epochs, learning_rate, logging, 
         del loss, mse
         torch.cuda.empty_cache()
     # 10. Save the model
-    torch.save(model.state_dict(), "few_with_bias_.pt")
+    torch.save(model.state_dict(), "few_with_last_.pt")
     # 11. Return the model
     return model
 
@@ -392,6 +383,7 @@ def train_weight_predictor():
 
   logging, pin_memory = False, True
   mask_ratio = 0.3
+  epochs, lr, batch_size = 100, 0.001, 3
   data, biases = load_pretrained_weight_matrices(mask_ratio)
   random.shuffle(data)
   print("Data Size:", len(data))
@@ -403,13 +395,14 @@ def train_weight_predictor():
   if logging:
     wandb.init(project="Weight Masking", entity="zs0316")
     wandb.config = {
-      "learning_rate": 0.001,
-      "epochs": 100,
-    "batch_size": 128
+      "learning_rate": lr,
+      "epochs": epochs,
+      "batch_size": batch_size,
+      "mask_ratio": mask_ratio,
+      "max_size": max_size
     }
     wandb.watch(model)
-  dataloader_ = RNNDataloader(train_set, batch_size=batch_size, pin_memory=pin_memory, biases = biases)
-  validation_dataloader_ = RNNDataloader(val_set, batch_size=batch_size, pin_memory=pin_memory, biases = biases)
-  tmodel = train(model, dataloader_, validation_dataloader_, num_epochs=300, learning_rate=0.001, logging = logging, pin_memory = pin_memory)
+  dataloader_ = RNNDataloader(train_set, batch_size=batch_size, pin_memory=pin_memory, biases = biases, num_workers = 5)
+  tmodel = train(model, dataloader_, validation_dataloader_, num_epochs=epochs, learning_rate=lr, logging = logging, pin_memory = pin_memory)
 
-train_weight_predictor()
+#train_weight_predictor()
