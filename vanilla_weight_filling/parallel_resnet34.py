@@ -14,7 +14,7 @@ import torch.optim as optim
 import torch.utils.data as data
 import torchvision
 import torchvision.transforms as transforms
-from torchvision.datasets import MNIST, ImageNet, CIFAR10
+from torchvision.datasets import CIFAR10
 import torchvision.models as models
 import torch.utils.data.dataloader as dataloader
 import numpy as np
@@ -27,6 +27,9 @@ import wandb
 import gc
 from torch.cuda.amp import GradScaler
 from torch.nn.utils import clip_grad_norm_ as clipGN
+from torchsummary import summary
+#import einops
+#einops.repeat(x, 'm n -> m k n', k=K)
 
 batch_size = 4
 max_size = 512
@@ -54,23 +57,39 @@ def load_pretrained_weight_matrices(mask_ratio):
     transform = transforms.Compose([transforms.ToTensor()])
     # initialzie the training and validation dataset
     print("[INFO] loading the training and validation dataset...")
-    pretrained_weights = []
+    pretrained_weights, biases = [], {}
 
     for name, param in pretrained_model.named_parameters():
         #print(name, pretrained_model.state_dict()[param].shape)
-        if 'weight' in name:
+        if 'bn' in name:
+           cur = param.detach().numpy()
+           cur_torch = torch.from_numpy(cur)
+           A = np.zeros([max_size])
+           A[:cur_torch.shape[0]] = cur
+           res = torch.from_numpy(A).double()#.unsqueeze(0)
+           #res = res.unsqueeze(0)
+           layer_name = name.split(".bn")[0]
+           print(name, cur_torch.shape)
+           if layer_name not in biases:
+              biases[layer_name] = [None, None]
+           if 'weight' in name:
+             biases[layer_name][0] = res
+           else:
+             biases[layer_name][1] = res
 
+        elif 'weight' in name:
             cur = param.detach().numpy()
+            cur_torch = torch.from_numpy(cur)
+
                 # cur_fixed = get_np_fixed_length(cur, cur.shape[0])
             A, A2 = np.zeros([max_size, max_size, 9]), np.zeros([max_size, max_size, 9])
-            cur_torch = torch.from_numpy(cur)
+
 
            # print(cur_torch.shape, cur.shape)
             try:
                 s = cur.shape[2]
             except:
                 continue
-            if (cur.shape[0] > max_size) or (cur.shape[1] > max_size) : continue
             #print("start")
             #print(name, cur_torch.shape)
             cur_torch = torch.flatten(cur_torch, start_dim=2, end_dim=3)
@@ -80,6 +99,7 @@ def load_pretrained_weight_matrices(mask_ratio):
             bool_mask = mask < mask_ratio
             masked = torch.from_numpy(bool_mask * cur)
             shapes = [1 for i in range(4)]
+
             for i in range(4):
                 try:
                     shapes[i] = cur.shape[i]
@@ -90,7 +110,9 @@ def load_pretrained_weight_matrices(mask_ratio):
             A2[:shapes[0], :shapes[1], :shapes[2]] = masked
            # B2 = np.einsum('ijkl->lkji', A2)
 
-            pretrained_weights.append((torch.from_numpy(A2).double(), torch.from_numpy(A).double()))
+            layer_name = name.split(".downsample")[0] if "downsample" in name else name.split(".conv")[0]
+
+            pretrained_weights.append((torch.from_numpy(A2).double(), torch.from_numpy(A).double(), layer_name))
             # A2[:cur.shape[0],:cur.shape[1] ,:cur.shape[2] , :cur.shape[3]] = masked
 
           #  pretrained_weights.append((torch.from_numpy(A2), torch.from_numpy(A)))
@@ -98,7 +120,7 @@ def load_pretrained_weight_matrices(mask_ratio):
        #     print(name)
 
     print("finished loading weight matrices from pretrained neural network")
-    return pretrained_weights
+    return pretrained_weights, biases
 
 
 # 2. Write backbone of a RNN dataloader
@@ -107,20 +129,20 @@ class RNNDataloader(dataloader.DataLoader):
     DataLoader for the RNN.
     """
 
-    def __init__(self, data, batch_size, shuffle=True, num_workers=1, pin_memory=False):
+    def __init__(self, data, batch_size, shuffle=True, num_workers=1, pin_memory=False, biases = {}):
         super(dataloader.DataLoader, self).__init__()
         self.data = data
-        self.data = self.data
         self.batch_size =  batch_size
         self.shuffle = shuffle
         self.num_workers = num_workers
-        self.img_batch_size = 250
+        self.img_batch_size = 3
         self.pin_memory = pin_memory
         self.resize_sz = 32
         src_dataset = CIFAR10(root='./data', train=True, download=True, transform= transforms.Compose([transforms.ToTensor(),transforms.Normalize([0.4914, 0.4822, 0.4465], [0.2471, 0.2435, 0.2616]),
                                                ]))
         trainDataLoader = DataLoader(src_dataset, batch_size=self.img_batch_size, shuffle=True)
         self.img_batch = next(iter(trainDataLoader))
+        self.biases = biases
         del src_dataset, trainDataLoader
         gc.collect()
         torch.cuda.empty_cache()
@@ -146,15 +168,26 @@ class RNNDataloader(dataloader.DataLoader):
                 img = self.img_batch[seed]
                # print("dataloader img", img.shape)
                 img = torch.flatten(img, start_dim=0, end_dim=1)
-                img = torch.permute(img, (2,1,0))
+                img = torch.permute(img, (0,1,2))
                 masked, target = t[1][0].clone().detach(), t[1][1].clone().detach()
                 prev, after = t[0][1].clone().detach(), t[2][0].clone().detach()
+                layer_name_ = t[1][2]
+
+
                 try:
+                  bn_weight, bn_biases = self.biases[layer_name_]
                   masked, prev, after = self.format_(masked), self.format_(prev), self.format_(after)
                   target = self.format_(target)
-               # print("dataloader",target.shape)
+                  bn = torch.vstack((bn_weight, bn_biases))
+                 # print("dataloader0",bn.shape)
+                  bn_ = bn.repeat(512, 1, 1)
+                  bn_ = torch.permute(bn_, (0,2,1))
+                 # print("dataloader1", bn_.shape)
+                 # bn_ = bn_.unsqueeze(0)
+                 # bn_ = bn_.repeat(9, 1, 1)
+                 # print("dataloader",bn_.shape)
 
-                  masked_.append([masked, prev, after, img])
+                  masked_.append([masked, prev, after, img, bn_])
                   targ_.append(target)
                 except Exception as e:
                   print(e)
@@ -179,7 +212,7 @@ class RNN(nn.Module):
     RNN from scratch for a sequence of data in pytorch
     """
 
-    def __init__(self, input_size, hidden_size, output_size, mask_ratio):
+    def __init__(self, input_size, hidden_size, output_size, mask_ratio=0.5):
         super(RNN, self).__init__()
         self.hidden_size = hidden_size
         self.input_size = input_size
@@ -188,52 +221,58 @@ class RNN(nn.Module):
         self.prev_layer = nn.Linear(input_size, hidden_size)
         self.after_layer = nn.Linear(input_size, hidden_size)
         self.hidden_layer = nn.Linear(hidden_size, hidden_size)
+        self.normalization_layer = nn.Linear(input_size, hidden_size)
+        self.bias_layer = nn.Linear(2, 9)
         self.unflatten_layer = nn.Unflatten(2, torch.Size([3,3]))
-        self.attn = nn.MultiheadAttention(hidden_size, hidden_size)
+        self.attn1 = nn.MultiheadAttention(hidden_size, hidden_size)
+        self.attn2 = nn.MultiheadAttention(hidden_size, hidden_size)
         self.img_batch_size = 8
         self.dummy_param = nn.Parameter(torch.empty(0))
         self.clip_val = 1
         self.resize_sz = 32
-        self.output_layer = nn.Linear(self.resize_sz, 9)
+        self.output_layer = nn.Linear(9, hidden_size)
         self.transition_layer = nn.Linear(hidden_size, self.resize_sz)
         self.mask_ratio = mask_ratio
 
-        self.img_layer = nn.Linear(750,self.hidden_size)
-        self.coordinating_layer = nn.Bilinear(self.resize_sz, 9,hidden_size)
+        self.img_layer = nn.Linear(self.resize_sz,self.hidden_size)
+        self.coordinating_layer = nn.Bilinear(self.resize_sz, self.resize_sz,9)
         gc.collect()
         torch.cuda.empty_cache()
 
 
-    def forward(self, input):
+    def forward(self, masked, prev, after, img, bn):
         """
         Forward pass of the RNN.
         """
      #   print(len(input))
       #  input = input[0]
-        input__ = input[0].to(d1)
+        input__ = masked.to(d1)
         input_ = self.input_layer(input__)
-        prev = input[1].to(d1)
-        prev_ = self.prev_layer(prev)
-        after = input[2].to(d1)
-        after_ = self.after_layer(after)
-        img_ = self.img_layer(input[3].to(d1))
-        img_ = torch.permute(img_, (2,1,0))
+        prev_ = self.prev_layer(prev.to(d1))
+        after_ = self.after_layer(after.to(d1))
+        bn_ = self.bias_layer(bn.to(d1))
+        img_ = self.img_layer(img.to(d1))
+      #  print("img:", img_.shape)
+        img_ = torch.permute(img_, (2,0,1))
 
       #  print("img:", img_.shape)
-
-        output = self.attn(prev_, after_, input_)[0]
+      #  print("bn", bn_.shape, "input_", input_.shape)
+        bn_ = torch.permute(bn_, (2, 0, 1))
+        input_ = self.attn1(bn_, input_, input_)[0]
+        output = self.attn2(prev_, after_, input_)[0]
 
         output = self.transition_layer(output)
-        output = torch.permute(output, (1,2, 0))
-       # print("attn_out:", output.shape)
+        output = torch.permute(output, (1, 0,2))
+      #  print("attn_out:", output.shape)
         coord = self.coordinating_layer(img_, output)
         coord = torch.permute(coord, (0,2,1))
        # print("coord", coord.shape)
         output = self.output_layer(coord)
 
-        output = torch.permute(output, (2,0,1))
+        output = torch.permute(output, (1,0,2))
        # print("output", output.shape)
-        unflattened = torch.permute(output, (1,2,0))
+        unflattened = torch.permute(output, (1,2, 0))
+
         unflattened = self.unflatten_layer(unflattened)
        # print("unflatten", unflattened.shape)
         gc.collect()
@@ -278,15 +317,17 @@ def train(model, dataloader, validation_dl, num_epochs, learning_rate, logging, 
 
             optimizer.zero_grad()
             # 5. Forward pass
-            inputs_ = inputs[0]
+            #print(len(inputs[0]))
+            masked, prev, after, img, bn = inputs[0]
+
             target_ = targets[0].cuda(non_blocking=pin_memory).to(d1)
 
             with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
 
-              outputs, unflattened = model(inputs_)
-            #  print("loss", outputs.shape, targets[0].shape)
+              outputs, unflattened = model(masked, prev, after, img, bn)
+              #print("loss", outputs.shape, targets[0].shape)
               loss = criterion(outputs, target_)
-            del inputs_
+            del masked, prev, after, img, bn, outputs, unflattened, target_
             torch.cuda.empty_cache()
             # 7. Compute the gradients
             scaler.scale(loss).backward()#retain_graph=True)
@@ -295,23 +336,20 @@ def train(model, dataloader, validation_dl, num_epochs, learning_rate, logging, 
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
-            #loss.backward()
-            #optimizer.step()
 
             gc.collect()
-            del target_, outputs
             torch.cuda.empty_cache()
         mse = MeanSquaredError().to(d1)
         valid_loss = 0.0
         model.eval()
         for vinputs, vtargets in validation_dl:
             vtarget_ = vtargets[0].to(d1)
-            vinputs_ = vinputs[0]
-            voutputs, unflattened = model(vinputs_)
+            masked, prev, after, img, bn = vinputs[0]
+            voutputs, unflattened = model(masked, prev, after, img, bn)
             vloss = mse(voutputs, vtarget_)
             valid_loss += vloss.item()
             gc.collect()
-            del vtarget_, vinputs_
+            del vtarget_, masked, prev, after, img, bn
             torch.cuda.empty_cache()
 
         if logging:
@@ -325,7 +363,7 @@ def train(model, dataloader, validation_dl, num_epochs, learning_rate, logging, 
         del loss, mse
         torch.cuda.empty_cache()
     # 10. Save the model
-    torch.save(model.state_dict(), "par_shaped.pt")
+    torch.save(model.state_dict(), "few_with_bias_.pt")
     # 11. Return the model
     return model
 
@@ -350,23 +388,28 @@ def load_model():
 
 import random
 
-logging, pin_memory = False, True
-mask_ratio = 0.3
-data = load_pretrained_weight_matrices(mask_ratio)
-random.shuffle(data)
-print("Data Size:", len(data))
-test_size = int(len(data) * 0.92)
-train_set, val_set = data[:test_size], data[test_size:]
-model = RNN(max_size, max_size, max_size, mask_ratio)
-model.to(d1)
-if logging:
-  wandb.init(project="Weight Masking", entity="zs0316")
-  wandb.config = {
-    "learning_rate": 0.001,
-    "epochs": 100,
-  "batch_size": 128
-  }
-  wandb.watch(model)
-dataloader_ = RNNDataloader(train_set, batch_size=batch_size, pin_memory=pin_memory)
-validation_dataloader_ = RNNDataloader(val_set, batch_size=batch_size, pin_memory=pin_memory)
-tmodel = train(model, dataloader_, validation_dataloader_, num_epochs=500, learning_rate=0.001, logging = logging, pin_memory = pin_memory)
+def train_weight_predictor():
+
+  logging, pin_memory = False, True
+  mask_ratio = 0.3
+  data, biases = load_pretrained_weight_matrices(mask_ratio)
+  random.shuffle(data)
+  print("Data Size:", len(data))
+  test_size = int(len(data) * 0.92)
+  train_set, val_set = data[:test_size], data[test_size:]
+  model = RNN(max_size, max_size, max_size, mask_ratio)
+  model.to(d1)
+ # summary(model, [(9,512, 512), (9,512, 512), (9,512, 512), (32, 32, 9)])
+  if logging:
+    wandb.init(project="Weight Masking", entity="zs0316")
+    wandb.config = {
+      "learning_rate": 0.001,
+      "epochs": 100,
+    "batch_size": 128
+    }
+    wandb.watch(model)
+  dataloader_ = RNNDataloader(train_set, batch_size=batch_size, pin_memory=pin_memory, biases = biases)
+  validation_dataloader_ = RNNDataloader(val_set, batch_size=batch_size, pin_memory=pin_memory, biases = biases)
+  tmodel = train(model, dataloader_, validation_dataloader_, num_epochs=300, learning_rate=0.001, logging = logging, pin_memory = pin_memory)
+
+train_weight_predictor()
