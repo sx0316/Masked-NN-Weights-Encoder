@@ -231,16 +231,12 @@ class RNN(nn.Module):
         img_ = self.img_layer(input[3].clone())
         img_ = torch.permute(img_, (0, 2, 1))
 
-        # print("img:", img_.shape, input_.shape)
-
         output = self.attn(prev_, after_, input_)[0]
 
         output = torch.permute(output, (2, 1, 0))
-        # print("attn_out:", output.shape)
-        # print("attn_out:", output.shape)
+
         coord = self.coordinating_layer(img_, output)
-        # print("coord:", coord.shape)
-        # output = self.output_layer(coord)
+
         output = torch.permute(coord, (2, 0, 1))
         # print("output shape:", output.shape)
         return output

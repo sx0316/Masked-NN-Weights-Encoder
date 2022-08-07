@@ -235,37 +235,26 @@ class RNN(nn.Module):
         """
         Forward pass of the RNN.
         """
-     #   print(len(input))
-      #  input = input[0]
-        input__ = masked.to(d1)
-        input_ = self.input_layer(input__)
+        input_ = self.input_layer(masked.to(d1))
         prev_ = self.prev_layer(prev.to(d1))
         after_ = self.after_layer(after.to(d1))
         bn_ = self.bias_layer(bn.to(d1))
+        bn_ = torch.permute(bn_, (2, 0, 1))
         img_ = self.img_layer(img.to(d1))
-      #  print("img:", img_.shape)
         img_ = torch.permute(img_, (2,0,1))
 
-      #  print("img:", img_.shape)
-      #  print("bn", bn_.shape, "input_", input_.shape)
-        bn_ = torch.permute(bn_, (2, 0, 1))
-        input_ = self.attn1(bn_, input_, input_)[0]
-        output = self.attn2(prev_, after_, input_)[0]
+        self_attn = self.attn1(bn_, input_, input_)[0]
+        weight_attn = self.attn2(prev_, after_, self_attn)[0]
 
-        output = self.transition_layer(output)
-        output = torch.permute(output, (1, 0,2))
-      #  print("attn_out:", output.shape)
-        coord = self.coordinating_layer(img_, output)
-        coord = torch.permute(coord, (0,2,1))
-       # print("coord", coord.shape)
-        output = self.output_layer(coord)
+        weight_attn = self.transition_layer(weight_attn)
+        weight_attn = torch.permute(weight_attn, (1, 0,2))
+        weight_img_ = self.coordinating_layer(img_, weight_attn)
+        weight_img_ = torch.permute(weight_img_, (0,2,1))
 
+        output = self.output_layer(weight_img_)
         output = torch.permute(output, (1,0,2))
-       # print("output", output.shape)
         unflattened = torch.permute(output, (1,2, 0))
-
         unflattened = self.unflatten_layer(unflattened)
-       # print("unflatten", unflattened.shape)
         gc.collect()
         del input__, prev, after, input_, prev_, after_, img_, coord
         torch.cuda.empty_cache()
